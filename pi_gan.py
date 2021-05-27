@@ -1,8 +1,5 @@
 import math
 
-from functools import partial
-from typing import Iterable, Iterator
-
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
@@ -13,15 +10,12 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 
-from tqdm import trange
-
 import torchvision
 from torchvision.utils import save_image
 
-from nerf import get_image_from_nerf_model, sample_cam_poses
-
-def get_module_device(module):
-    return next(module.parameters()).device
+from nerf import *
+import imageio
+import numpy as np
 
 # losses
 def gradient_penalty(images, output) -> torch.Tensor:
@@ -73,6 +67,7 @@ class EqualizedLinear(nn.Linear):
         bound = 1 / math.sqrt(self.in_features)
         nn.init.uniform_(self.bias, -bound, bound)
 
+
 # Mapping network
 class MappingNetwork(nn.Module):    
     def __init__(self, dim_in:int=128, dim_hidden:int=256, num_hidden:int=3, dim_out=[256 for i in range(8)]+[128]):
@@ -84,15 +79,30 @@ class MappingNetwork(nn.Module):
             mlp_layers.append(nn.LeakyReLU(negative_slope=0.2))
         self.mlp = nn.Sequential(*mlp_layers)
         
-        self.to_gammas = nn.ModuleList([nn.Linear(dim_hidden, d) for d in dim_out])
-        self.to_betas = nn.ModuleList([nn.Linear(dim_hidden, d) for d in dim_out[:6]])
+        self.to_gammas = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim_hidden, dim_hidden),
+                nn.LeakyReLU(negative_slope=0.2),
+                nn.Linear(dim_hidden, d)
+            )
+             for d in dim_out
+        ])
+        self.to_betas = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim_hidden, dim_hidden),
+                nn.LeakyReLU(negative_slope=0.2),
+                nn.Linear(dim_hidden, d)
+            )
+             for d in dim_out
+        ])
+        self.dim_out = dim_out
 
     def forward(self, x):
         x = F.normalize(x, dim=-1)
         x = self.mlp(x)
-        
-        gammas = [l(x) for l in self.to_gammas]
-        betas = [l(x) * (0.4 * 0.5**i) for i, l in enumerate(self.to_betas)] + [None] * (len(self.to_gammas) - len(self.to_betas))
+
+        gammas = [l(x) * 2. for l in self.to_gammas] + [None] * (len(self.dim_out) - len(self.to_gammas))
+        betas = [l(x) * 0.1 for i, l in enumerate(self.to_betas)] + [None] * (len(self.dim_out) - len(self.to_betas))
         
         return gammas, betas
 
@@ -113,10 +123,11 @@ class SIRENGenerator(nn.Module):
 
         self.to_rgb_siren = FiLMSIREN(in_features=dim_hidden + dim_d, out_features=dim_hidden // 2)
         self.to_rgb_linear = nn.Linear(dim_hidden // 2, 3)
+        
 
     def forward(self, latent_z, coords_x, views_d, batch_size:int=8192):
-        assert latent_z.dim() == 1, 'latent_z should be 1 dim vector'
         latent_z = latent_z.view(1, -1)
+
         gammas, betas = self.mapping(latent_z)
           
         outs = []
@@ -141,12 +152,14 @@ class ImageGenerator(nn.Module):
         image_size,
         dim_latent,
         dim_hidden,
-        siren_num_layers
+        siren_num_layers,
+        device_ids
     ):
         super().__init__()
         self.dim_latent = dim_latent
         self.image_size = image_size
-
+        self.device_ids = device_ids
+        
         self.nerf_model = SIRENGenerator(
             dim_latent=dim_latent,
             dim_hidden=dim_hidden,
@@ -156,18 +169,72 @@ class ImageGenerator(nn.Module):
     def set_image_size(self, image_size):
         self.image_size = image_size
 
-    def forward(self, latents:torch.Tensor, camera_poses:torch.Tensor):
+    def forward(self, latents:torch.Tensor, camera_poses:torch.Tensor, with_importance=True):
         image_size = self.image_size
 
-        generated_images = get_image_from_nerf_model(
-            self.nerf_model,
+        generated_images = self.get_image_from_nerf_model(
             latents,
             camera_poses,
             image_size,
-            image_size
+            image_size,
+            with_importance=with_importance
         )
 
         return generated_images
+    
+    def get_image_from_nerf_model(
+        self,
+        latents:torch.Tensor,
+        cam2world:torch.Tensor,
+        height:int,
+        width:int,
+        fov_y=0.2,
+        near_thresh:float=0.7,
+        far_thresh:float=1.3,
+        samples_per_ray=24,
+        with_importance:bool=True
+    ):
+        assert latents.shape[0] == cam2world.shape[0]
+
+        images = []
+        depth_images = []
+        
+        for latent, c2w in zip(latents.unbind(dim=0), cam2world.unbind(0)):   # for each (latent, c2w), generate an image
+            c2w = c2w.cuda() 
+            ray_origins, ray_directions = get_ray_bundle(height, width, fov_y, c2w)
+
+            if with_importance:
+                # uniform sample 1/2
+                query_points, query_dirs, depth_values = compute_query_points_from_rays(ray_origins, ray_directions, near_thresh, far_thresh, samples_per_ray // 2, False, None)
+                flattened_query_points = query_points.reshape((-1, 3))
+                flattened_query_dirs = query_dirs.reshape((-1, 3))
+                
+                with torch.no_grad():
+                    radiance_field_flattened = self.nerf_model(latent, flattened_query_points, flattened_query_dirs).detach()
+                unflattened_shape = list(query_points.shape[:-1]) + [4]
+                radiance_field = torch.reshape(radiance_field_flattened, unflattened_shape)
+                weights = render_volume_weight(radiance_field, ray_origins, depth_values)
+
+                # importance sample 1/2
+                new_depth_values = sample_importance(depth_values, weights,  samples_per_ray // 2, randomize=True)
+                depth_values = torch.cat([depth_values, new_depth_values], dim=-1).sort()[0]
+                query_points, query_dirs, new_depth_values = compute_query_points_from_rays(ray_origins, ray_directions, near_thresh, far_thresh, samples_per_ray, False, depth_values)
+            else:
+                query_points, query_dirs, depth_values = compute_query_points_from_rays(ray_origins, ray_directions, near_thresh, far_thresh, samples_per_ray, True, None)
+            
+            flattened_query_points = query_points.reshape((-1, 3))
+            flattened_query_dirs = query_dirs.reshape((-1, 3))
+            
+            radiance_field_flattened = self.nerf_model(latent, flattened_query_points, flattened_query_dirs)
+            unflattened_shape = list(query_points.shape[:-1]) + [4]
+            radiance_field = torch.reshape(radiance_field_flattened, unflattened_shape)
+            rgb_predicted, depth_predicted, _ = render_volume(radiance_field, ray_origins, depth_values)
+            image = rgb_predicted.permute((2, 0, 1))    # (h, w, c) -> (c, h, w)
+            
+            images.append(image)
+            depth_images.append(depth_predicted)
+
+        return torch.stack(images), torch.stack(depth_images)
 
 # CoordConv
 class CoordConv2D(nn.Module):
@@ -252,14 +319,13 @@ class Discriminator(nn.Module):
         self.iterations = 0
         self.cur_resolution = init_resolution
 
-    def increase_resolution_(self):
-        if self.cur_resolution >= self.final_resolution:
+    def set_resolution(self, new_resolution, fadein=True):
+        if new_resolution >= self.final_resolution:
             return
-        
-        self.fadein = True
+        self.fadein = fadein
         self.alpha = 0.
         self.iterations = 0
-        self.cur_resolution *= 2
+        self.cur_resolution = new_resolution
 
     def update_iter_(self):
         if not self.fadein:
@@ -299,13 +365,13 @@ class piGAN:
 
     def __init__(self, dataset, device_ids=[0, 1, 2, 3]):
         self.image_size = 64
-        self.G = ImageGenerator(
+        self.G = nn.DataParallel(ImageGenerator(
             image_size=16,
             dim_latent=128,
             dim_hidden=256,
-            siren_num_layers=8
-        )
-        self.G = nn.DataParallel(self.G, device_ids=device_ids).cuda()
+            siren_num_layers=8,
+            device_ids=device_ids
+        ), device_ids=device_ids).cuda()
 
         self.D = Discriminator(
             init_resolution=16,
@@ -316,8 +382,8 @@ class piGAN:
         self.optim_G = Adam(self.G.parameters(), betas=(0, 0.9), lr=5e-5)
         self.optim_D = Adam(self.D.parameters(), betas=(0, 0.9), lr=4e-4)
         
-        self.lr_scheduler_G =lr_scheduler.ExponentialLR(self.optim_G, gamma=0.2**(1./20000))
-        self.lr_scheduler_D =lr_scheduler.ExponentialLR(self.optim_D, gamma=0.25**(1./20000))
+        self.lr_scheduler_G =lr_scheduler.ExponentialLR(self.optim_G, gamma=0.2**(1./30000))
+        self.lr_scheduler_D =lr_scheduler.ExponentialLR(self.optim_D, gamma=0.25**(1./30000))
 
         self.loss_D = 0.
         self.loss_G = 0.
@@ -332,9 +398,10 @@ class piGAN:
 
         self.dataset = dataset 
         self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size_D, shuffle=True)
+        
+        self.cur_resolution = 16
 
     def train(self, num_iters):
-        
         self.dataloader_cycle = cycle(self.dataloader)
         
         for i in range(num_iters):
@@ -360,6 +427,9 @@ class piGAN:
             if self.iterations % 100 == 0:
                 print('[Test]')
                 self.test_imgs()
+                self.test_video(traj='circle')
+                self.test_video(traj='straight')
+                
             
             if self.iterations % 1000 == 0:
                 print('[Save check point]')
@@ -368,20 +438,20 @@ class piGAN:
             self.iterations += 1
 
     def train_step(self):
-        if self.iterations % self.grow_iters == 0 and self.D.module.cur_resolution < self.image_size:
-            print(f'Resolution Grow to {self.D.module.cur_resolution * 2}')
+        if self.iterations % self.grow_iters == 0 and self.cur_resolution < self.image_size:
+            print(f'Resolution Grow to {self.cur_resolution * 2}')
+            self.cur_resolution *= 2
             if self.iterations != 0:
-                self.D.module.increase_resolution_()
+                self.D.module.set_resolution(self.cur_resolution)
 
-            cur_image_size = self.D.module.cur_resolution
-            self.G.module.set_image_size(cur_image_size)
-            self.dataset.create_transform(cur_image_size)
-            self.batch_size_G = 16384 // (cur_image_size * cur_image_size)
+            self.G.module.set_image_size(self.cur_resolution)
+            self.dataset.create_transform(self.cur_resolution)
+            self.batch_size_G = 16384 // (self.cur_resolution * self.cur_resolution)
             
         # Train Discriminator
         self.D.train()
         
-        tiny_steps = 2
+        tiny_steps = 1
         self.loss_D = 0.
         i = 0
         while i == 0 or (i < tiny_steps and self.loss_D > self.loss_G):
@@ -393,7 +463,7 @@ class piGAN:
             with torch.no_grad():
                 rand_latents = torch.randn(self.batch_size_D, self.G.module.dim_latent).cuda()
                 cam2world = sample_cam_poses(0.3, 0.15, self.batch_size_D).cuda()
-                fake_imgs = self.G(rand_latents, cam2world)
+                fake_imgs, _ = self.G(rand_latents, cam2world, with_importance=self.iterations>15000)
             fake_imgs.detach_()
             
             fake_imgs_D_out = self.D(fake_imgs)
@@ -411,7 +481,7 @@ class piGAN:
             self.optim_D.step()
 
         # Train Generator
-        tiny_steps = 2
+        tiny_steps = 1
         
         self.G.train()
         i = 0
@@ -420,7 +490,7 @@ class piGAN:
             #print(f'G [{i:5d}/{tiny_steps:5d}]', end='\r')
             rand_latents = torch.randn(self.batch_size_G // 2, self.G.module.dim_latent).cuda().repeat((2, 1))
             cam2world = sample_cam_poses(0.3, 0.15, self.batch_size_G).cuda()
-            fake_imgs = self.G(rand_latents, cam2world)
+            fake_imgs, _ = self.G(rand_latents, cam2world, with_importance=self.iterations>15000)
             
             loss = torch.mean(F.softplus(-self.D(fake_imgs)))
             
@@ -433,15 +503,40 @@ class piGAN:
         self.D.module.update_iter_()
 
     def test_imgs(self):
+        '''4 x 4 = 16 images of currenct resolution'''
         self.G.eval()
         with torch.no_grad():
             rand_latents = torch.randn(4, self.G.module.dim_latent).cuda()
             rand_latents = rand_latents[:, None, :].repeat((1, 4, 1)).reshape(16, -1)
-            cam2world = sample_cam_poses(0.2, 0.2, 16).cuda()
-            fake_imgs = self.G(rand_latents, cam2world)
-        torchvision.utils.save_image(fake_imgs, f'/output/test/iter_{str(self.iterations).zfill(6)}.png', nrow=4)
+            cam2world = get_cam_poses(torch.linspace(-0.3, 0.3, 4), torch.zeros(4), torch.ones(4)).cuda()
+            cam2world = cam2world.repeat((4, 1, 1))
+            fake_imgs, depth_imgs = self.G(rand_latents, cam2world)
         
+        depth_imgs = torch.exp(- 3. * depth_imgs + 2.)[:, None, :, :]
+        
+        torchvision.utils.save_image(fake_imgs, f'/output/test/iter_{str(self.iterations).zfill(6)}.png', nrow=4)
+        torchvision.utils.save_image(depth_imgs, f'/output/test/iter_{str(self.iterations).zfill(6)}_depth.png', nrow=4)
+    
+    def test_video(self, traj:str='circle'):
+        self.G.eval()
+        with torch.no_grad():
+            rand_latents = torch.randn(1, self.G.module.dim_latent).cuda()
+            rand_latents = rand_latents[:, :].repeat((128, 1))
+            
+            if traj == 'circle':
+                theta = torch.linspace(0, 6.28, 128)
+                cam2world = get_cam_poses(0.3 * torch.cos(theta), 0.3 * torch.sin(theta), torch.ones(128)).cuda()
+            elif traj == 'straight':
+                cam2world = get_cam_poses(torch.linspace(-0.6, 0.6, 128), torch.zeros(128), torch.ones(128)).cuda()
+                
+            fake_imgs, _ = self.G(rand_latents, cam2world)
+            
+        fake_imgs = (fake_imgs.permute((0, 2, 3, 1)).cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
+        save_path = f'/output/test/iter_{str(self.iterations).zfill(6)}_{traj}.mp4'
+        imageio.mimwrite(save_path, fake_imgs, fps=30, quality=8) 
+    
     def save_ckpt(self, path):
+
         state = {
             'G':self.G.module.state_dict(), 
             'D':self.D.module.state_dict(),
@@ -449,11 +544,17 @@ class piGAN:
             'optim_D':self.optim_D.state_dict(),
             'lr_scheduler_G':self.lr_scheduler_G.state_dict(),
             'lr_scheduler_D':self.lr_scheduler_D.state_dict(),
-            'iterations':self.iterations
+            'iterations':self.iterations,
+            
+            'cur_resolution':self.cur_resolution,
+            'fadein':self.D.module.fadein,
+            'fadein_alpha':self.D.module.alpha,
+            'fadein_iterations':self.D.module.iterations,
             }
         torch.save(state, path)
+        
 
-    def load_ckpt(self, path):
+    def load_ckpt(self, path): 
         state = torch.load(path)
 
         self.G.module.load_state_dict(state['G'])
@@ -463,4 +564,22 @@ class piGAN:
         self.lr_scheduler_G.load_state_dict(state['lr_scheduler_G'])
         self.lr_scheduler_D.load_state_dict(state['lr_scheduler_D'])
         self.iterations = state['iterations']
+        
+        self.cur_resolution = state['cur_resolution'] if 'cur_resolution' in state.keys() else 64
+        self.D.module.cur_resolution = self.cur_resolution
+        self.D.module.fadein = state['fadein'] if 'fadein' in state.keys() else False
+        self.D.module.alpha = state['fadein_alpha'] if 'fadein_alpha' in state.keys() else 0.
+        self.D.module.iterations = state['fadein_iterations'] if 'fadein_iterations' in state.keys() else 0
+        
+        
+        self.G.module.set_image_size(self.cur_resolution)
+        self.dataset.create_transform(self.cur_resolution)
+        self.batch_size_G = 16384 // (self.cur_resolution * self.cur_resolution)
 
+
+    def reset_optimizer(self):
+        self.optim_G = Adam(self.G.parameters(), betas=(0, 0.9), lr=0.4e-5)
+        self.optim_D = Adam(self.D.parameters(), betas=(0, 0.9), lr=0.4e-4)
+        
+        self.lr_scheduler_G =lr_scheduler.ExponentialLR(self.optim_G, gamma=0.2**(1./20000))
+        self.lr_scheduler_D =lr_scheduler.ExponentialLR(self.optim_D, gamma=0.25**(1./20000))
