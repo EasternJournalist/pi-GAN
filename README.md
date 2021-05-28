@@ -34,8 +34,11 @@ This pi-GAN implementation is partly based on the the version of [lucidrains/pi-
    model.load_ckpt('[YOUR CKPT PATH]')
    
    # Train
-   model.train(40000) # train for 40000 iterations
+   model.train(40000) # train for 40000 iterations 
    ```
 
-   
+
+
+
+ `run.ipynb` is the same as all of the `.py` files. You may either run pi-GAN in the notebook which could be convenient for debugging.
 
