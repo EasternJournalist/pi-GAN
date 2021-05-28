@@ -3,6 +3,8 @@ A pytorch implementation of pi-GAN, for 3d-aware image synthesis, following the 
 
 This pi-GAN implementation is partly based on the the version of [lucidrains/pi-GAN-pytorch: Implementation of π-GAN, for 3d-aware image synthesis, in Pytorch (github.com)](https://github.com/lucidrains/pi-GAN-pytorch)
 
+<img src="https://raw.githubusercontent.com/EasternJournalist/pi-GAN/main/imgs/demo.jpg" style="zoom: 50%;" />
+
 ## Requirements
 
 * python 3.6+
