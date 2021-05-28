@@ -6,15 +6,17 @@ from PIL import Image
 import torchvision.transforms as T
 import torchvision
 from pathlib import Path
+from config import *
 
 class ImageDataset(Dataset):
     def __init__(self, folder=None, image_size=64, transparent:bool=False, aug_prob:bool=0., exts = ['jpg', 'jpeg', 'png']):
         super(ImageDataset, self).__init__()
         self.image_size = image_size
         
-        if os.path.exists('/data/52WangRuicheng/FFHQ64pkl/all_imgs.pkl'):
+        cache_path = os.path.join(cache_dir, 'all_imgs.pkl')
+        if os.path.exists(cache_path):
             print('Load pickle')
-            with open('/data/52WangRuicheng/FFHQ64pkl/all_imgs.pkl', 'rb') as f:
+            with open(cache_path , 'rb') as f:
                 self.all_imgs = pickle.load(f)
         else:
             print('Get Paths...')
@@ -28,7 +30,7 @@ class ImageDataset(Dataset):
                 print(f'[{i + 1:>5d}/{len(self.paths):>5d}]', end='\r')
             print()
             print('Save pickle...')
-            with open('/data/52WangRuicheng/FFHQ64pkl/all_imgs.pkl', 'wb') as f:
+            with open(cache_path , 'wb') as f:
                 pickle.dump(self.all_imgs, f, 1)
         self.img_arr = None
         
@@ -53,4 +55,4 @@ class ImageDataset(Dataset):
     def __getitem__(self, index):
         return self.img_arr[index]
 
-dataset = ImageDataset('/data/52WangRuicheng/FFHQ64/image64_rescale', 16)
+dataset = ImageDataset(image_data_dir, 16)

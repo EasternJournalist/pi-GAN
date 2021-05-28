@@ -1,3 +1,6 @@
+from ntpath import join
+from config import *
+
 import math
 
 import torch
@@ -16,6 +19,7 @@ from torchvision.utils import save_image
 from nerf import *
 import imageio
 import numpy as np
+import os
 
 # losses
 def gradient_penalty(images, output) -> torch.Tensor:
@@ -169,7 +173,7 @@ class ImageGenerator(nn.Module):
     def set_image_size(self, image_size):
         self.image_size = image_size
 
-    def forward(self, latents:torch.Tensor, camera_poses:torch.Tensor, with_importance=True):
+    def forward(self, latents:torch.Tensor, camera_poses:torch.Tensor, samples_per_ray:int=32, with_importance=True):
         image_size = self.image_size
 
         generated_images = self.get_image_from_nerf_model(
@@ -177,6 +181,7 @@ class ImageGenerator(nn.Module):
             camera_poses,
             image_size,
             image_size,
+            samples_per_ray=samples_per_ray,
             with_importance=with_importance
         )
 
@@ -191,7 +196,7 @@ class ImageGenerator(nn.Module):
         fov_y=0.2,
         near_thresh:float=0.7,
         far_thresh:float=1.3,
-        samples_per_ray=24,
+        samples_per_ray:int=32,
         with_importance:bool=True
     ):
         assert latents.shape[0] == cam2world.shape[0]
@@ -433,7 +438,7 @@ class piGAN:
             
             if self.iterations % 1000 == 0:
                 print('[Save check point]')
-                self.save_ckpt(f'/output/ckpt{str(self.iterations).zfill(6)}.pth')
+                self.save_ckpt(os.path.join(test_save_dir, f'ckpt{str(self.iterations).zfill(6)}.pth'))
 
             self.iterations += 1
 
@@ -463,7 +468,7 @@ class piGAN:
             with torch.no_grad():
                 rand_latents = torch.randn(self.batch_size_D, self.G.module.dim_latent).cuda()
                 cam2world = sample_cam_poses(0.3, 0.15, self.batch_size_D).cuda()
-                fake_imgs, _ = self.G(rand_latents, cam2world, with_importance=self.iterations>15000)
+                fake_imgs, _ = self.G(rand_latents, cam2world, 32, with_importance=self.iterations>25000)
             fake_imgs.detach_()
             
             fake_imgs_D_out = self.D(fake_imgs)
@@ -490,7 +495,7 @@ class piGAN:
             #print(f'G [{i:5d}/{tiny_steps:5d}]', end='\r')
             rand_latents = torch.randn(self.batch_size_G // 2, self.G.module.dim_latent).cuda().repeat((2, 1))
             cam2world = sample_cam_poses(0.3, 0.15, self.batch_size_G).cuda()
-            fake_imgs, _ = self.G(rand_latents, cam2world, with_importance=self.iterations>15000)
+            fake_imgs, _ = self.G(rand_latents, cam2world, 32, with_importance=self.iterations>15000)
             
             loss = torch.mean(F.softplus(-self.D(fake_imgs)))
             
@@ -510,12 +515,12 @@ class piGAN:
             rand_latents = rand_latents[:, None, :].repeat((1, 4, 1)).reshape(16, -1)
             cam2world = get_cam_poses(torch.linspace(-0.3, 0.3, 4), torch.zeros(4), torch.ones(4)).cuda()
             cam2world = cam2world.repeat((4, 1, 1))
-            fake_imgs, depth_imgs = self.G(rand_latents, cam2world)
+            fake_imgs, depth_imgs = self.G(rand_latents, cam2world, 128, True)
         
         depth_imgs = torch.exp(- 3. * depth_imgs + 2.)[:, None, :, :]
         
-        torchvision.utils.save_image(fake_imgs, f'/output/test/iter_{str(self.iterations).zfill(6)}.png', nrow=4)
-        torchvision.utils.save_image(depth_imgs, f'/output/test/iter_{str(self.iterations).zfill(6)}_depth.png', nrow=4)
+        torchvision.utils.save_image(fake_imgs, os.path.join(test_save_dir, f'iter_{str(self.iterations).zfill(6)}.png'), nrow=4)
+        torchvision.utils.save_image(depth_imgs, os.path.join(test_save_dir,f'iter_{str(self.iterations).zfill(6)}_depth.png'), nrow=4)
     
     def test_video(self, traj:str='circle'):
         self.G.eval()
@@ -529,11 +534,10 @@ class piGAN:
             elif traj == 'straight':
                 cam2world = get_cam_poses(torch.linspace(-0.6, 0.6, 128), torch.zeros(128), torch.ones(128)).cuda()
                 
-            fake_imgs, _ = self.G(rand_latents, cam2world)
+            fake_imgs, _ = self.G(rand_latents, cam2world, 64, True)
             
         fake_imgs = (fake_imgs.permute((0, 2, 3, 1)).cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
-        save_path = f'/output/test/iter_{str(self.iterations).zfill(6)}_{traj}.mp4'
-        imageio.mimwrite(save_path, fake_imgs, fps=30, quality=8) 
+        imageio.mimwrite(os.path.join(test_save_dir,'iter_{str(self.iterations).zfill(6)}_{traj}.mp4'), fake_imgs, fps=30, quality=8) 
     
     def save_ckpt(self, path):
 
